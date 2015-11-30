@@ -53,7 +53,8 @@ private[spark] class TaskSetManager(
     sched: TaskSchedulerImpl,
     val taskSet: TaskSet,
     val maxTaskFailures: Int,
-    clock: Clock = new SystemClock())
+    clock: Clock = new SystemClock(),
+    val backend: SchedulerBackend = null)
   extends Schedulable with Logging {
 
   val conf = sched.sc.conf
@@ -66,11 +67,15 @@ private[spark] class TaskSetManager(
    */
   private val EXECUTOR_TASK_BLACKLIST_TIMEOUT =
     conf.getLong("spark.scheduler.executorTaskBlacklistTime", 0L)
+  
 
   // Quantile of tasks at which to start speculation
   val SPECULATION_QUANTILE = conf.getDouble("spark.speculation.quantile", 0.75)
   val SPECULATION_MULTIPLIER = conf.getDouble("spark.speculation.multiplier", 1.5)
-
+  val KILL_AND_RESTART = conf.getBoolean("spark.speculation.kill",false)
+  val STRAGGLER_BLACKLIST = conf.getBoolean("spark.speculation.blacklist",false)
+  val STRAGGLER_BLACKlIST_TIMEOUT = conf.getLong("spark.scheduler.stragglerBlacklistTime",10000)
+  
   // Limit of bytes for total size of results (default is 1GB)
   val maxResultSize = Utils.getMaxResultSize(conf)
 
@@ -88,7 +93,7 @@ private[spark] class TaskSetManager(
 
   val taskAttempts = Array.fill[List[TaskInfo]](numTasks)(Nil)
   var tasksSuccessful = 0
-
+  var speculativeExecutionCount = 0
   var weight = 1
   var minShare = 0
   var priority = taskSet.priority
@@ -97,7 +102,7 @@ private[spark] class TaskSetManager(
   var parent: Pool = null
   var totalResultSize = 0L
   var calculatedTasks = 0
-
+  val stragglingExecutors = new HashMap[String,Long]
   val runningTasksSet = new HashSet[Long]
 
   override def runningTasks: Int = runningTasksSet.size
@@ -176,7 +181,10 @@ private[spark] class TaskSetManager(
   override def schedulingMode: SchedulingMode = SchedulingMode.NONE
 
   var emittedTaskSizeWarning = false
-
+  val taskIdToExecutorId = new HashMap[Long, String]
+  def mapTaskToExecutor(tid: Long, eid: String){
+    taskIdToExecutorId(tid)=eid
+  }
   /** Add a task to all the pending-task lists that it should be on. */
   private def addPendingTask(index: Int) {
     // Utility method that adds `index` to a list only if it's not already there
@@ -281,6 +289,9 @@ private[spark] class TaskSetManager(
       return failed.contains(execId) &&
         clock.getTimeMillis() - failed.get(execId).get < EXECUTOR_TASK_BLACKLIST_TIMEOUT
     }
+    if(stragglingExecutors.contains(execId)){
+      return (clock.getTimeMillis() - stragglingExecutors.get(execId).get) < STRAGGLER_BLACKlIST_TIMEOUT
+    }
 
     false
   }
@@ -297,7 +308,7 @@ private[spark] class TaskSetManager(
     speculatableTasks.retain(index => !successful(index)) // Remove finished tasks from set
 
     def canRunOnHost(index: Int): Boolean =
-      !hasAttemptOnHost(index, host) && !executorIsBlacklisted(execId, index)
+      /*!hasAttemptOnHost(index, host) &&*/ !executorIsBlacklisted(execId, index)
 
     if (!speculatableTasks.isEmpty) {
       // Check for process-local tasks; note that tasks can be process-local
@@ -370,6 +381,8 @@ private[spark] class TaskSetManager(
   private def dequeueTask(execId: String, host: String, maxLocality: TaskLocality.Value)
     : Option[(Int, TaskLocality.Value, Boolean)] =
   {
+    
+     
     for (index <- dequeueTaskFromList(execId, getPendingTasksForExecutor(execId))) {
       return Some((index, TaskLocality.PROCESS_LOCAL, false))
     }
@@ -401,10 +414,14 @@ private[spark] class TaskSetManager(
         return Some((index, TaskLocality.ANY, false))
       }
     }
-
-    // find a speculative task if all others tasks have been scheduled
+    
+     // find a speculative task if all others tasks have been scheduled
     dequeueSpeculativeTask(execId, host, maxLocality).map {
       case (taskIndex, allowedLocality) => (taskIndex, allowedLocality, true)}
+ 
+   
+ 
+  
   }
 
   /**
@@ -443,6 +460,8 @@ private[spark] class TaskSetManager(
           // Found a task; do some bookkeeping and return a task description
           val task = tasks(index)
           val taskId = sched.newTaskId()
+          if(speculative == true)
+             speculativeExecutionCount = speculativeExecutionCount+1;
           // Do various bookkeeping
           copiesRunning(index) += 1
           val attemptNum = taskAttempts(index).size
@@ -630,6 +649,7 @@ private[spark] class TaskSetManager(
       // Mark successful and stop if all the tasks have succeeded.
       successful(index) = true
       if (tasksSuccessful == numTasks) {
+        logInfo("Number of Speculative Executions: "+speculativeExecutionCount)
         isZombie = true
       }
     } else {
@@ -839,11 +859,28 @@ private[spark] class TaskSetManager(
         val index = info.index
         if (!successful(index) && copiesRunning(index) == 1 && info.timeRunning(time) > threshold &&
           !speculatableTasks.contains(index)) {
-          logInfo(
+          
+          
+         if(KILL_AND_RESTART && backend != null)
+         {
+           backend.killTask(tid, taskIdToExecutorId(tid), false)
+           foundTasks=false
+           logInfo(
+            "Killing and restarting task %d in stage %s (on %s) as speculatable because it ran more than %.0f ms"
+              .format(index, taskSet.id, info.host, threshold))
+           stragglingExecutors.put(info.executorId,time)
+         }
+         else if(STRAGGLER_BLACKLIST){
+           stragglingExecutors.put(info.executorId,time)
+         }
+         else{
+           foundTasks = true
+           speculatableTasks += index
+           logInfo(
             "Marking task %d in stage %s (on %s) as speculatable because it ran more than %.0f ms"
               .format(index, taskSet.id, info.host, threshold))
-          speculatableTasks += index
-          foundTasks = true
+         }
+          
         }
       }
     }

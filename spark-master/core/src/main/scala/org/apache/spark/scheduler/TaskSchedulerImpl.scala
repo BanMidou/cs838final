@@ -32,7 +32,7 @@ import org.apache.spark._
 import org.apache.spark.TaskState.TaskState
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.TaskLocality.TaskLocality
-import org.apache.spark.util.{ThreadUtils, Utils}
+import org.apache.spark.util.{ThreadUtils, Utils, SystemClock}
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.storage.BlockManagerId
 
@@ -197,7 +197,7 @@ private[spark] class TaskSchedulerImpl(
   private[scheduler] def createTaskSetManager(
       taskSet: TaskSet,
       maxTaskFailures: Int): TaskSetManager = {
-    new TaskSetManager(this, taskSet, maxTaskFailures)
+    new TaskSetManager(this, taskSet, maxTaskFailures,new SystemClock(),backend)
   }
 
   override def cancelTasks(stageId: Int, interruptThread: Boolean): Unit = synchronized {
@@ -254,6 +254,8 @@ private[spark] class TaskSchedulerImpl(
             val tid = task.taskId
             taskIdToTaskSetManager(tid) = taskSet
             taskIdToExecutorId(tid) = execId
+            taskSet.mapTaskToExecutor(tid,execId)
+            
             executorIdToTaskCount(execId) += 1
             executorsByHost(host) += execId
             availableCpus(i) -= CPUS_PER_TASK
