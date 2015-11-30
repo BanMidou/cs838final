@@ -308,7 +308,7 @@ private[spark] class TaskSetManager(
     speculatableTasks.retain(index => !successful(index)) // Remove finished tasks from set
 
     def canRunOnHost(index: Int): Boolean =
-      /*!hasAttemptOnHost(index, host) &&*/ !executorIsBlacklisted(execId, index)
+      !hasAttemptOnHost(index, host) && !executorIsBlacklisted(execId, index)
 
     if (!speculatableTasks.isEmpty) {
       // Check for process-local tasks; note that tasks can be process-local
