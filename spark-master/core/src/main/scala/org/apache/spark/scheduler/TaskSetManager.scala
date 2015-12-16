@@ -74,7 +74,7 @@ private[spark] class TaskSetManager(
   val SPECULATION_MULTIPLIER = conf.getDouble("spark.speculation.multiplier", 1.5)
   val KILL_AND_RESTART = conf.getBoolean("spark.speculation.kill",false)
   val STRAGGLER_BLACKLIST = conf.getBoolean("spark.speculation.blacklist",false)
-  val STRAGGLER_BLACKlIST_TIMEOUT = conf.getLong("spark.scheduler.stragglerBlacklistTime",10000)
+  val STRAGGLER_BLACKlIST_TIMEOUT = conf.getLong("spark.scheduler.stragglerBlacklistTime",200)
   
   // Limit of bytes for total size of results (default is 1GB)
   val maxResultSize = Utils.getMaxResultSize(conf)
@@ -277,7 +277,13 @@ private[spark] class TaskSetManager(
   private def hasAttemptOnHost(taskIndex: Int, host: String): Boolean = {
     taskAttempts(taskIndex).exists(_.host == host)
   }
-
+ 
+  private def hostBlackListed(host: String): Boolean ={
+   if(stragglingExecutors.contains(host)){
+      return (clock.getTimeMillis() - stragglingExecutors.get(host).get) < STRAGGLER_BLACKlIST_TIMEOUT
+    }
+    false
+  }
   /**
    * Is this re-execution of a failed task on an executor it already failed in before
    * EXECUTOR_TASK_BLACKLIST_TIMEOUT has elapsed ?
@@ -289,9 +295,7 @@ private[spark] class TaskSetManager(
       return failed.contains(execId) &&
         clock.getTimeMillis() - failed.get(execId).get < EXECUTOR_TASK_BLACKLIST_TIMEOUT
     }
-    if(stragglingExecutors.contains(execId)){
-      return (clock.getTimeMillis() - stragglingExecutors.get(execId).get) < STRAGGLER_BLACKlIST_TIMEOUT
-    }
+   
 
     false
   }
@@ -308,8 +312,9 @@ private[spark] class TaskSetManager(
     speculatableTasks.retain(index => !successful(index)) // Remove finished tasks from set
 
     def canRunOnHost(index: Int): Boolean =
-      !hasAttemptOnHost(index, host) && !executorIsBlacklisted(execId, index)
+      !hasAttemptOnHost(index, host) && !executorIsBlacklisted(execId, index) && !hostBlackListed(host)
 
+      
     if (!speculatableTasks.isEmpty) {
       // Check for process-local tasks; note that tasks can be process-local
       // on multiple nodes when we replicate cached blocks, as in Spark Streaming
@@ -868,10 +873,13 @@ private[spark] class TaskSetManager(
            logInfo(
             "Killing and restarting task %d in stage %s (on %s) as speculatable because it ran more than %.0f ms"
               .format(index, taskSet.id, info.host, threshold))
-           stragglingExecutors.put(info.executorId,time)
+           stragglingExecutors.put(info.host,time)
          }
          else if(STRAGGLER_BLACKLIST){
-           stragglingExecutors.put(info.executorId,time)
+           logInfo(
+            "Blacklisting executor %s for running a task for more than %.0f ms"
+              .format(info.host, threshold))
+           stragglingExecutors.put(info.host,time)
          }
          else{
            foundTasks = true
